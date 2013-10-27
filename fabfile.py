@@ -114,6 +114,9 @@ def install_virtualenvwrapper():
 def install_npm():
     sudo('apt-get install -y npm')
 
+def install_yuglify():
+    sudo('npm install yuglify -g')
+
 def install_jshint():
     sudo('npm install jshint -g')
 
@@ -255,6 +258,8 @@ def install_dependencies():
     install_postgres()
     install_memcached()
     install_supervisor()
+    install_npm()
+    install_yuglify()
 
 def create_virtualenv():
     with settings(warn_only=True):
