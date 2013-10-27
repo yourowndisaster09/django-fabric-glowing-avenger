@@ -321,7 +321,7 @@ def setup_env_memcache():
 
 def setup_env_nginx():
     with cd(env.project_root):
-        sudo('cp tools/nginx/%(env_name)s /etc/nginx/sites-available/%(project)s' % env)
+        sudo('cp tools/nginx/%(env_name)s.conf /etc/nginx/sites-available/%(project)s' % env)
         sudo('ln -sf /etc/nginx/sites-available/%(project)s /etc/nginx/sites-enabled/' % env)
         nginx('restart')
 
