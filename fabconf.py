@@ -1,6 +1,11 @@
 PROJECT = 'project_name'
 REPOSITORY = 'repo.git'
 VIRTUALENV = 'virtualenv_name'
+
+USE_SOLR = False
+USE_PIL = True
+USE_CELERY = False
+
 ADDITIONAL_PACKAGES = []
 ADDITIONAL_MANAGEMENT_COMMANDS = []
 

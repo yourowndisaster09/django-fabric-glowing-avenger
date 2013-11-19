@@ -1,5 +1,6 @@
 # Django + nginx + git + postgresql + memcached + supervisor
 
+import datetime, time
 from os.path import dirname, join
 from sys import path
 
@@ -8,7 +9,7 @@ from fabric.context_managers import cd, hide, prefix
 from fabric.contrib import django
 from fabric.contrib.console import confirm
 from fabric.contrib.files import contains, exists, sed
-from fabric.operations import local, put, run, sudo
+from fabric.operations import get, local, put, run, sudo
 from fabric.utils import warn
 
 import fabconf
@@ -39,9 +40,13 @@ def _initialize_variables():
 
     # Remote directories
     env.home = '/home/ubuntu'
+
     env.project_root = join(env.home, env.project)
     env.django_root = join(env.project_root, env.project)
     env.virtualenv_dir = join(env.home, '.virtualenvs', env.virtualenv)
+
+    if fabconf.USE_SOLR:
+        env.solr_root = join(env.home, 'solr')
 
 def development():
     """
@@ -87,7 +92,7 @@ def install(installs_str):
 def install_jenkins():
     run('wget -q -O - http://pkg.jenkins-ci.org/debian/jenkins-ci.org.key | sudo apt-key add -')
     sudo('sh -c "echo deb http://pkg.jenkins-ci.org/debian binary/ > /etc/apt/sources.list.d/jenkins.list"')
-    sudo('apt-get update')
+    sudo('apt-get -y update')
     sudo('apt-get -y install jenkins')
 
 def install_git():
@@ -112,10 +117,15 @@ def install_virtualenvwrapper():
     sudo('pip install virtualenvwrapper')
 
 def install_npm():
-    sudo('apt-get install -y npm')
+    sudo('add-apt-repository ppa:richarvey/nodejs')
+    sudo('apt-get -y update')
+    sudo('apt-get install -y nodejs npm')
 
 def install_yuglify():
     sudo('npm install yuglify -g')
+
+def install_less():
+    sudo('npm install less -g')
 
 def install_jshint():
     sudo('npm install jshint -g')
@@ -125,6 +135,26 @@ def install_csslint():
 
 def install_sloccount():
     sudo('apt-get install -y sloccount')
+
+def install_pil():
+    pil = ['libjpeg8-dev', 'zlib1g-dev', 'libfreetype6-dev', 'liblcms1-dev']
+    pil_links = ['libjpeg.so', 'libz.so', 'libfreetype.so', 'liblcms.so']
+    sudo('apt-get install -y %s' % ' '.join(pil))
+    with settings(warn_only=True):
+        for link in pil_links:
+            if run('test -h /usr/lib/%s' % link).failed:
+                sudo('ln -s /usr/lib/x86_64-linux-gnu/%s /usr/lib' % link)
+
+def install_solr(replace=False):
+    if replace or not exists('/var/lib/solr'):
+        run('wget -c http://archive.apache.org/dist/lucene/solr/4.5.1/solr-4.5.1.tgz')
+        run('tar xzf solr-4.5.1.tgz')
+        run('mv solr-4.5.1/example /home/ubuntu/solr')
+        run('rm -rf solr-4.5.1.tgz')
+        run('rm -rf solr-4.5.1')
+
+def install_rabbitmq():
+    sudo('apt-get install -y rabbitmq-server')
 
 def install_additional_packages():
     if fabconf.ADDITIONAL_PACKAGES:
@@ -147,18 +177,45 @@ def memcached(cmd):
 def supervisor(cmd):
     sudo('service supervisor %s' % cmd)
 
+def rabbitmq(cmd):
+    sudo('service rabbitmq-server %s' % cmd)
+
+def supervisorctl(cmd):
+    sudo('supervisorctl %s' % cmd)
+
+def managepy(cmd):
+    with prefix('source %(virtualenv_dir)s/bin/activate' % env):
+        with cd(env.django_root):
+            with prefix('source ~/.secrets'):
+                run('python manage.py %s' % cmd)
+
 
 ###############
 ## View logs ##
 ###############
+NGINX_ACCESS_LOG = lambda: '/var/log/nginx/%(project)s.access.log;' % env
+NGINX_ERROR_LOG = lambda: '/var/log/nginx/%(project)s.error.log' % env
+MEMCACHED_LOG = lambda: '/var/log/memcached.log'
+GUNICORN_LOG = lambda: '/var/log/%(project)s/gunicorn.log' % env
+GUNICORN_ERROR_LOG = lambda: '/var/log/%(project)s/gunicorn.err' % env
+SOLR_LOG = lambda: '/var/log/%(project)s/solr.log' % env
+SOLR_ERROR_LOG = lambda: '/var/log/%(project)s/solr.err' % env
+CELERY_LOG = lambda: '/var/log/%(project)s/celery.log' % env
+CELERY_ERROR_LOG = lambda: '/var/log/%(project)s/celery.err' % env
 
 def tail(logfile):
+    if logfile in globals():
+        logfile = globals()[logfile]()
     run('tail -f %s' % logfile)
 
 def tac(logfile):
+    if logfile in globals():
+        logfile = globals()[logfile]()
     run('tac %s | less' % logfile)
 
 def cat(logfile):
+    if logfile in globals():
+        logfile = globals()[logfile]()
     run('cat %s | less' % logfile)
 
 
@@ -203,6 +260,45 @@ def setup_database_from_settings():
     password = database.get('PASSWORD')
     setup_database(name, user, password)
 
+def download_database(local_path=None):
+    with settings(hide('everything')):
+        with prefix('source ~/.secrets'):
+            dbname = run('echo $DATABASE_NAME')
+    now = datetime.datetime.utcnow().strftime("%m-%d-%y-%H-%M-%S")
+    filename = '/tmp/{0}-{1}.sql'.format(dbname, now)
+    sudo('pg_dump {0} > {1}'.format(dbname, filename), user='postgres')
+    get(filename, local_path)
+    sudo('mv %s /var/backups' % filename)
+
+
+############################
+## RabbitMQ Broker setups ##
+############################
+
+def setup_broker(user, password, vhost):
+    """
+    Creates a RabbitMQ user, a virtual host
+    and allow that user access to that virtual host
+
+    """
+    with settings(warn_only=True):
+        sudo('rabbitmqctl add_user {0} {1}'.format(user, password))
+        sudo('rabbitmqctl add_vhost {0}'.format(vhost))
+        sudo('rabbitmqctl set_permissions -p {0} {1} ".*" ".*" ".*"'.format(vhost, user))
+    rabbitmq('restart')
+
+def setup_broker_from_secrets():
+    """
+    Gets broker configurations from environment variables set in secrets
+
+    """
+    with settings(hide('everything')):
+        with prefix('source ~/.secrets'):
+            user = run('echo $BROKER_USER')
+            password = run('echo $BROKER_PASSWORD')
+            vhost = run('echo $BROKER_VHOST')
+    setup_broker(user, password, vhost)
+
 
 #####################################
 ## Remote environment server utils ##
@@ -246,10 +342,7 @@ def add_pub_key():
     _add_pub_key(location, user)
 
 def create_superuser():
-    with prefix('source %(virtualenv_dir)s/bin/activate' % env):
-        with cd(env.django_root):
-            with prefix('source ~/.secrets'):
-                run('python manage.py createsuperuser')
+    managepy('createsuperuser')
 
 def install_dependencies():
     install_git()
@@ -260,6 +353,16 @@ def install_dependencies():
     install_supervisor()
     install_npm()
     install_yuglify()
+    install_less()
+
+    if fabconf.USE_SOLR:
+        install_solr()
+
+    if fabconf.USE_PIL:
+        install_pil()
+
+    if fabconf.CELERY:
+        install_rabbitmq()
 
 def create_virtualenv():
     with settings(warn_only=True):
@@ -267,10 +370,18 @@ def create_virtualenv():
             with prefix('source /usr/local/bin/virtualenvwrapper.sh'):
                 run('mkvirtualenv --no-site-packages --distribute %(virtualenv)s' % env)
 
-def install_django_packages():
+def pip_install(pkg):
     with cd(env.project_root):
         with prefix('source %(virtualenv_dir)s/bin/activate' % env):
-            run('pip install -r requirements/%(env_name)s.txt' % env)
+            run('pip install %s' % pkg)
+
+def pip_uninstall(pkg):
+    with cd(env.project_root):
+        with prefix('source %(virtualenv_dir)s/bin/activate' % env):
+            run('pip uninstall %s' % pkg)
+
+def install_django_packages():
+    pip_install('-r requirements/%(env_name)s.txt' % env)
 
 def get_project_from_repo():
     if not exists(env.project_root):
@@ -289,41 +400,49 @@ def get_project_from_repo():
                 run('git pull')
 
 def prepare_django_project():
-    with prefix('source %(virtualenv_dir)s/bin/activate' % env):
-        with cd(env.django_root):
-            with prefix('source ~/.secrets'):
-                run('python manage.py syncdb --noinput')
-                run('python manage.py migrate --noinput')
-                run('python manage.py collectstatic --noinput')
-                if fabconf.ADDITIONAL_MANAGEMENT_COMMANDS:
-                    for cmd in fabconf.ADDITIONAL_MANAGEMENT_COMMANDS:
-                        run(cmd)
+    managepy('syncdb --noinput')
+    managepy('migrate --noinput')
+    managepy('collectstatic --noinput')
+
+    for cmd in fabconf.ADDITIONAL_MANAGEMENT_COMMANDS:
+        managepy(cmd)
+
+def prepare_solr():
+    with cd(env.project_root):
+        run('cp tools/solr/solrconfig.xml ~/solr/solr/collection1/conf/solrconfig.xml')
+        run('cp tools/solr/stopwords_en.txt ~/solr/solr/collection1/conf/stopwords_en.txt')
+    managepy('build_solr_schema > ~/solr/solr/collection1/conf/schema.xml')
+
+def rebuild_solr():
+    managepy('rebuild_index --noinput')
 
 def access_shell():
-    with prefix('source %(virtualenv_dir)s/bin/activate' % env):
-        with cd(env.django_root):
-            with prefix('source ~/.secrets'):
-                run('python manage.py shell --plain')
+    managepy('shell --plain')
 
 def prepare_log_directory():
     sudo('mkdir -p /var/log/%(project)s' % env)
 
 def setup_env_supervisor():
+    supervisor('stop')
     with cd(env.project_root):
-        supervisor('stop')
         sudo('cp tools/supervisor/%(env_name)s.conf /etc/supervisor/conf.d/%(project)s.conf' % env)
-        supervisor('start')
+    if fabconf.USE_SOLR:
+        prepare_solr()
+    supervisor('start')
+    if fabconf.USE_SOLR:
+        time.sleep(10)
+        rebuild_solr()
 
 def setup_env_memcache():
     with cd(env.project_root):
         sudo('cp tools/memcached/%(env_name)s.conf /etc/memcached.conf' % env)
-        memcached('restart')
+    memcached('restart')
 
 def setup_env_nginx():
     with cd(env.project_root):
-        sudo('cp tools/nginx/%(env_name)s.conf /etc/nginx/sites-available/%(project)s' % env)
-        sudo('ln -sf /etc/nginx/sites-available/%(project)s /etc/nginx/sites-enabled/' % env)
-        nginx('restart')
+        sudo('cp tools/nginx/%(env_name)s /etc/nginx/sites-available/%(project)s' % env)
+    sudo('ln -sf /etc/nginx/sites-available/%(project)s /etc/nginx/sites-enabled/' % env)
+    nginx('restart')
 
 def deploy():
     """
